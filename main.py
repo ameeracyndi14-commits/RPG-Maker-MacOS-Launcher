@@ -9,6 +9,7 @@ import platform
 import chardet
 import logging
 import re
+from pathlib import Path
 from functools import partial
 from evbunpack.__main__ import unpack_files
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog,
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDial
                                QDialogButtonBox, QScrollArea, QGroupBox, QFormLayout, QLabel, QCheckBox, QProgressDialog, QLineEdit, QPlainTextEdit)
 from PySide6.QtCore import QTimer, QDateTime, Qt
 
-current_version = "3.3.3"
+current_version = "3.3.4"
 config_version = ""
 latest_commit_sha = ""
 last_commit_sha = ""
@@ -162,6 +163,10 @@ class RPGMLauncher(QMainWindow):
         self.disable_protection_checkbox = QCheckBox("Disable Protection (Not Recommended)", self)
         self.layout.addWidget(self.disable_protection_checkbox)
 
+        self.getpixel_patch_checkbox = QCheckBox("Patch Bitmap.getPixel (Fix NaN/Infinity Crash)", self)
+        self.getpixel_patch_checkbox.setChecked(True)
+        self.layout.addWidget(self.getpixel_patch_checkbox)
+
         self.selected_folder_label = QLabel("No folder selected", self)
         self.layout.addWidget(self.selected_folder_label)
 
@@ -224,7 +229,8 @@ class RPGMLauncher(QMainWindow):
             "   - 'Extract game_en.exe': Extracts the file and patches the game with the English version.\n"
             "   - 'Add Cheat Menu': Patch the game with a cheat menu (Press [1] key while in game).\n"
             "   - 'Optimize Space': Optimize the game folder size by removing the Windows version of NWJS.\n"
-            "   - 'Disable Protection': Allows child_process to be used and allows outbound connections.\n\n"
+            "   - 'Disable Protection': Allows child_process to be used and allows outbound connections.\n"
+            "   - 'Patch Bitmap.getPixel': Fixes crashes related to NaN/Infinity in Bitmap.getPixel.\n\n"
             "4. Click 'Start Game' to launch the game using the selected NWJS version.\n\n"
             "5. Click 'Export as Standalone App' to create a standalone application for the game.\n\n"
             "6. Click 'Open Save Editor' to open the save editor website and the save folder.\n\n"
@@ -238,7 +244,7 @@ class RPGMLauncher(QMainWindow):
         
         dialog = QDialog(self)
         dialog.setWindowTitle("Instructions")
-        dialog.resize(650, 570)
+        dialog.resize(650, 590)
         layout = QVBoxLayout(dialog)
 
         text_edit = QPlainTextEdit(dialog)
@@ -292,6 +298,7 @@ class RPGMLauncher(QMainWindow):
                     self.cheat_menu_checkbox.setChecked(settings.get('add_cheat_menu', False))
                     self.optimize_space_checkbox.setChecked(settings.get('optimize_space', False))
                     self.disable_protection_checkbox.setChecked(settings.get('disable_protection', False))
+                    self.getpixel_patch_checkbox.setChecked(settings.get('patch_getpixel', True))
                     last_version = settings.get('last_selected_version')
                     if last_version and last_version in [self.version_selector.itemText(i) for i in range(self.version_selector.count())]:
                         self.version_selector.setCurrentText(last_version)
@@ -318,6 +325,7 @@ class RPGMLauncher(QMainWindow):
             'add_cheat_menu': self.cheat_menu_checkbox.isChecked(),
             'optimize_space': self.optimize_space_checkbox.isChecked(),
             'disable_protection': self.disable_protection_checkbox.isChecked(),
+            'patch_getpixel': self.getpixel_patch_checkbox.isChecked(),
             'last_selected_version': self.version_selector.currentText(),
             'last_selected_folder': self.last_selected_folder,
             'launcher_version': current_version,
@@ -1010,6 +1018,164 @@ class RPGMLauncher(QMainWindow):
         shutil.copy(os.path.join(os.path.dirname(__file__), 'disable-net.js'), folder_path)
         logging.info("Protection scripts added to the game folder.")
 
+    def patch_rpgm_getpixel(self, game_path, enable=True):
+        # --- RPG Maker MV/MZ patch helpers ---
+        RPGM_GETPIXEL_PATCH_BEGIN = "/* RPGM-Launcher getPixel finite patch begin */"
+        RPGM_GETPIXEL_PATCH_END = "/* RPGM-Launcher getPixel finite patch end */"
+
+        """Patch and unpatch Bitmap.prototype.getPixel in RPG Maker MV/MZ core JS.
+
+        Looks for:
+        - <game>/js or <game>/www/js
+        - rmmz_core.js or rpg_core.js
+
+        When enabled, inserts a finite-check guard right after the line:
+        Bitmap.prototype.getPixel = function (x, y) {
+
+        When disabled, removes the guard if it was previously inserted (with or without markers).
+        """
+        result = {"ok": False, "changed": False, "patched": False, "js_file": None, "message": ""}
+
+        if not game_path or not os.path.isdir(game_path):
+            result["message"] = "Invalid game path."
+            return result
+
+        # Find JS folder
+        js_dir = None
+        js_candidate_1 = os.path.join(game_path, "js")
+        js_candidate_2 = os.path.join(game_path, "www", "js")
+        if os.path.isdir(js_candidate_1):
+            js_dir = js_candidate_1
+        elif os.path.isdir(js_candidate_2):
+            js_dir = js_candidate_2
+
+        if not js_dir:
+            result["message"] = "Could not find a 'js' or 'www/js' folder in the game directory."
+            return result
+
+        # Pick core file (prefer MZ)
+        core_file = None
+        mz_core = os.path.join(js_dir, "rmmz_core.js")
+        mv_core = os.path.join(js_dir, "rpg_core.js")
+        if os.path.isfile(mz_core):
+            core_file = mz_core
+        elif os.path.isfile(mv_core):
+            core_file = mv_core
+
+        if not core_file:
+            result["message"] = "Could not find rmmz_core.js or rpg_core.js in the JS folder."
+            return result
+
+        result["js_file"] = core_file
+
+        try:
+            raw = Path(core_file).read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            result["message"] = f"Failed to read core JS file: {e}"
+            return result
+
+        # Preserve newline style
+        nl = "\r\n" if "\r\n" in raw else "\n"
+
+        # Match the getPixel function signature line (spacing may differ across versions)
+        sig_re = re.compile(
+            r"^\s*Bitmap\.prototype\.getPixel\s*=\s*function\s*\(\s*x\s*,\s*y\s*\)\s*\{\s*$",
+            re.MULTILINE,
+        )
+        m = sig_re.search(raw)
+        if not m:
+            result["message"] = "Could not locate 'Bitmap.prototype.getPixel = function (x, y) {' in the core JS file."
+            return result
+
+        # Compute insertion/removal position: immediately after the signature line's newline
+        sig_line_end = raw.find(nl, m.end())
+        if sig_line_end == -1:
+            # Signature is last line
+            sig_line_end = len(raw)
+            after_sig = len(raw)
+        else:
+            after_sig = sig_line_end + len(nl)
+
+        patch_block = (
+            f"    {RPGM_GETPIXEL_PATCH_BEGIN}{nl}"
+            f"    if (!Number.isFinite(x) || !Number.isFinite(y)) {{{nl}"
+            f"        return '#000000';{nl}"
+            f"    }}{nl}"
+            f"    {RPGM_GETPIXEL_PATCH_END}{nl}"
+        )
+
+        # Fast path: already patched (marker-based)
+        if RPGM_GETPIXEL_PATCH_BEGIN in raw and RPGM_GETPIXEL_PATCH_END in raw:
+            if enable:
+                result.update({"ok": True, "changed": False, "patched": True, "message": "Already patched."})
+                return result
+            # Disable -> remove marker block
+            begin_idx = raw.find(RPGM_GETPIXEL_PATCH_BEGIN)
+            end_idx = raw.find(RPGM_GETPIXEL_PATCH_END, begin_idx)
+            if end_idx != -1:
+                end_idx = raw.find(nl, end_idx)
+                if end_idx == -1:
+                    end_idx = len(raw)
+                else:
+                    end_idx += len(nl)
+
+                prefix = raw[:begin_idx]
+                if not prefix.endswith(nl):
+                    prefix = prefix.rstrip(" \t") + nl
+                new_raw = prefix + raw[end_idx:]
+                if new_raw != raw:
+                    try:
+                        Path(core_file).write_text(new_raw, encoding="utf-8")
+                        result.update({"ok": True, "changed": True, "patched": False, "message": "Patch removed."})
+                    except Exception as e:
+                        result["message"] = f"Failed to write core JS file: {e}"
+                    return result
+
+            result.update({"ok": True, "changed": False, "patched": False, "message": "Patch markers found but could not remove cleanly."})
+            return result
+
+        # Marker-less patch detection/removal right after the signature line
+        # (Only inspect a small window after the signature to avoid deleting unrelated code.)
+        window = raw[after_sig: after_sig + 600]
+
+        snippet_re = re.compile(
+            r"^\s*if\s*\(\s*!Number\.isFinite\(x\)\s*\|\|\s*!Number\.isFinite\(y\)\s*\)\s*\{\s*\r?\n"
+            r"\s*return\s*['\"]#000000['\"];\s*\r?\n"
+            r"\s*\}\s*\r?\n",
+            re.MULTILINE,
+        )
+        snippet_m = snippet_re.search(window)
+
+        if enable:
+            if snippet_m:
+                result.update({"ok": True, "changed": False, "patched": True, "message": "Already patched (no markers)."})
+                return result
+
+            # Insert patch block
+            new_raw = raw[:after_sig] + patch_block + raw[after_sig:]
+            try:
+                Path(core_file).write_text(new_raw, encoding="utf-8")
+                result.update({"ok": True, "changed": True, "patched": True, "message": "Patch applied."})
+            except Exception as e:
+                result["message"] = f"Failed to write core JS file: {e}"
+            return result
+
+        # disable
+        if snippet_m:
+            # Remove just the snippet region found in the window
+            start = after_sig + snippet_m.start()
+            end = after_sig + snippet_m.end()
+            new_raw = raw[:start] + raw[end:]
+            try:
+                Path(core_file).write_text(new_raw, encoding="utf-8")
+                result.update({"ok": True, "changed": True, "patched": False, "message": "Patch removed (no markers)."})
+            except Exception as e:
+                result["message"] = f"Failed to write core JS file: {e}"
+            return result
+
+        result.update({"ok": True, "changed": False, "patched": False, "message": "No patch found; nothing to remove."})
+        return result
+
     def start_game(self):
         folder_path = self.last_selected_folder
         if not folder_path:
@@ -1050,6 +1216,14 @@ class RPGMLauncher(QMainWindow):
             
             if not self.disable_protection_checkbox.isChecked():
                 self.add_protection_script(folder_path)
+
+            patch_res = self.patch_rpgm_getpixel(folder_path, enable=self.getpixel_patch_checkbox.isChecked())
+            if not patch_res.get("ok"):
+                logging.warning("getPixel patch: %s", patch_res.get("message"))
+                if self.getpixel_patch_checkbox.isChecked():
+                    QMessageBox.warning(self, "getPixel patch", f"Could not apply getPixel patch:\n{patch_res.get('message')}, Not an RPG maker game?")
+            else:
+                logging.info("getPixel patch: %s", patch_res.get("message"))
 
             self.launch_nwjs_game(folder_path)
         elif self.check_game_ini(folder_path):
