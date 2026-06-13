@@ -24,6 +24,8 @@ Ethereum Wallet:<br>
 5. Launches game
 # How to build
 If the [prebuilt releases](https://github.com/m5kro/RPG-Maker-MacOS-Launcher/releases/latest) don't work, or you'd like to add a feature, here are instructions on how to build the app:<br><br>
+Recommended Python version is 3.11<br>
+<br>
 Native version (Specifically x64 or arm64 depending on your system):
 1. Clone the repo <br> `git clone https://github.com/m5kro/RPG-Maker-MacOS-Launcher` <br> `cd RPG-Maker-MacOS-Launcher`
 2. Setup the venv <br> `python3 -m venv RPGM-Launcher` <br> `source RPGM-Launcher/bin/activate`
